@@ -1,0 +1,17 @@
+services:
+  qanything_parsers:
+    container_name: qanything-parsers-local
+    image: xixihahaliu01/qanything-win:v1.5.1
+    command: /bin/bash -c "cd /workspace/QAnything && bash scripts/entrypoint_parsers.sh"
+    privileged: true
+    shm_size: '2gb'
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/:/workspace/QAnything/
+    ports:
+      - "9009:9009"
+      - "7001:7001"
+    environment:
+      - NCCL_LAUNCH_MODE=PARALLEL
+      - GPUID=0
+    tty: true
+    stdin_open: true

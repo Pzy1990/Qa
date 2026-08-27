@@ -1,0 +1,24 @@
+services:
+  qanything_local:
+    container_name: qanything-container-local
+    image: xixihahaliu01/qanything-win:v1.5.1
+    command: /bin/bash -c "cd /workspace/QAnything && bash scripts/entrypoint.sh"
+    privileged: true
+    shm_size: '2gb'
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/:/workspace/QAnything/
+    ports:
+      - "8777:8777"
+    environment:
+      - NCCL_LAUNCH_MODE=PARALLEL
+      - GPUID=${GPUID:-0}
+      - USER_IP=${USER_IP:-0.0.0.0}
+      - GATEWAY_IP=host.docker.internal
+      # 存储层部署在机器 B（默认 192.168.110.169），通过局域网访问
+      - MILVUS_HOST_LOCAL=${MILVUS_HOST_LOCAL:-192.168.110.169}
+      - MILVUS_PORT=${MILVUS_PORT:-19540}
+      - ES_URL=${ES_URL:-http://192.168.110.169:9210/}
+      - MYSQL_HOST_LOCAL=${MYSQL_HOST_LOCAL:-192.168.110.169}
+      - MYSQL_PORT_LOCAL=${MYSQL_PORT_LOCAL:-3316}
+    tty: true
+    stdin_open: true
