@@ -97,7 +97,7 @@ def safe_get(req: Request, attr: str, default=None):
         if attr in req.form:
             return req.form.getlist(attr)[0]
         if attr in req.args:
-            return req.args[attr]
+            return req.args[attr][0]
         if attr in req.json:
             return req.json[attr]
         # if value := req.form.get(attr):
