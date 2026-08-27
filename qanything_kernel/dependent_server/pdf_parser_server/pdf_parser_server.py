@@ -22,6 +22,8 @@ import argparse
 import tempfile
 import shutil
 import base64
+import re
+import requests
 
 # 接收外部参数mode
 parser = argparse.ArgumentParser()
@@ -44,6 +46,39 @@ async def init_pdf_parser(app, loop):
     app.ctx.pdf_parser = PdfLoader(device=torch.device('cpu') if not args.use_gpu else torch.device('cuda'))
     end = time.time()
     print(f'init pdf_parser cost {end - start}s', flush=True)
+
+
+def ocr_image(img_path):
+    """调用本容器内的 OCR 服务（localhost:7001）识别图片文字，返回文字行列表。"""
+    try:
+        with open(img_path, 'rb') as f:
+            img64 = base64.b64encode(f.read()).decode('utf-8')
+        resp = requests.post("http://localhost:7001/ocr", data={"img64": img64}, timeout=120)
+        resp.raise_for_status()
+        result = resp.json().get('result', [])
+        if not isinstance(result, list):
+            return []
+        return [line for line in result if isinstance(line, str) and line.strip()]
+    except Exception as e:
+        print(f"ocr image {img_path} failed: {e}", flush=True)
+        return []
+
+
+def embed_ocr_text(markdown_text, img_dir):
+    """把图片 OCR 出的文字插回 markdown 中对应图片占位符（![figure](...)）的正下方，
+    从而保持“前文 xxx —— 图片文字 —— 后文 xxx”的文档顺序。"""
+    pattern = re.compile(r'!\[figure\]\(([^\s"\)]+)(?:\s+"[^"]*")?\)')
+
+    def repl(m):
+        img_file = m.group(1)
+        img_path = os.path.join(img_dir, img_file)
+        ocr_lines = ocr_image(img_path)
+        if not ocr_lines:
+            return m.group(0)
+        ocr_text = '\n'.join(ocr_lines)
+        return m.group(0) + '\n' + ocr_text
+
+    return pattern.sub(repl, markdown_text)
 
 
 @app.post("/pdfparser")
@@ -75,6 +110,10 @@ async def pdf_parser(request: Request):
 
         # 解析结果目录（markdown 所在目录）里的图片一并打包返回
         img_dir = os.path.dirname(markdown_file)
+
+        # 对 PDF 中的图片做 OCR，把识别文字插回图片占位处（保持文档顺序）
+        markdown_text = embed_ocr_text(markdown_text, img_dir)
+
         images = []
         if os.path.isdir(img_dir):
             for fn in sorted(os.listdir(img_dir)):
