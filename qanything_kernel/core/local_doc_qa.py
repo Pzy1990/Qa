@@ -256,7 +256,7 @@ class LocalDocQA:
                 debug_logger.info(f"use rerank, rerank docs num: {len(docs)}")
                 docs = await self.rerank.arerank_documents(query, docs)
                 if len(docs) > 1:
-                    docs = [doc for doc in docs if doc.metadata['score'] >= 0.28]
+                    docs = [doc for doc in docs if doc.metadata['score'] >= 0.3]
                 return docs
             except Exception as e:
                 debug_logger.error(f"query tokens: {num_tokens_rerank(query)}, rerank error: {e}")
@@ -531,14 +531,14 @@ class LocalDocQA:
                 debug_logger.info(f"rerank step1 num: {len(source_documents)}")
                 debug_logger.info(f"rerank step1 scores: {[doc.metadata['score'] for doc in source_documents]}")
                 if len(source_documents) > 1:
-                    if filtered_documents := [doc for doc in source_documents if doc.metadata['score'] >= 0.28]:
+                    if filtered_documents := [doc for doc in source_documents if doc.metadata['score'] >= 0.3]:
                         source_documents = filtered_documents
                     debug_logger.info(f"rerank step2 num: {len(source_documents)}")
                     saved_docs = [source_documents[0]]
                     for doc in source_documents[1:]:
                         debug_logger.info(f"rerank doc score: {doc.metadata['score']}")
                         relative_difference = (saved_docs[0].metadata['score'] - doc.metadata['score']) / saved_docs[0].metadata['score']
-                        if relative_difference > 0.5:
+                        if relative_difference > 0.3:
                             break
                         else:
                             saved_docs.append(doc)

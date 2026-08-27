@@ -49,33 +49,32 @@ async def init_pdf_parser(app, loop):
 
 
 def ocr_image(img_path):
-    """调用本容器内的 OCR 服务（localhost:7001）识别图片文字，返回文字行列表。"""
+    """调用本容器内的 OCR 服务（localhost:7001 /ocr_layout）对图片做版面+表格识别，返回 markdown 文本。"""
     try:
         with open(img_path, 'rb') as f:
             img64 = base64.b64encode(f.read()).decode('utf-8')
-        resp = requests.post("http://localhost:7001/ocr", data={"img64": img64}, timeout=120)
+        resp = requests.post("http://localhost:7001/ocr_layout", data={"img64": img64}, timeout=120)
         resp.raise_for_status()
-        result = resp.json().get('result', [])
-        if not isinstance(result, list):
-            return []
-        return [line for line in result if isinstance(line, str) and line.strip()]
+        result = resp.json().get('result', '')
+        if not isinstance(result, str):
+            return ''
+        return result.strip()
     except Exception as e:
         print(f"ocr image {img_path} failed: {e}", flush=True)
-        return []
+        return ''
 
 
 def embed_ocr_text(markdown_text, img_dir):
-    """把图片 OCR 出的文字插回 markdown 中对应图片占位符（![figure](...)）的正下方，
+    """把图片 OCR 出的文字（含版面+表格 markdown）插回 markdown 中对应图片占位符（![figure](...)）的正下方，
     从而保持“前文 xxx —— 图片文字 —— 后文 xxx”的文档顺序。"""
     pattern = re.compile(r'!\[figure\]\(([^\s"\)]+)(?:\s+"[^"]*")?\)')
 
     def repl(m):
         img_file = m.group(1)
         img_path = os.path.join(img_dir, img_file)
-        ocr_lines = ocr_image(img_path)
-        if not ocr_lines:
+        ocr_text = ocr_image(img_path)
+        if not ocr_text:
             return m.group(0)
-        ocr_text = '\n'.join(ocr_lines)
         return m.group(0) + '\n' + ocr_text
 
     return pattern.sub(repl, markdown_text)

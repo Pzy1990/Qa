@@ -567,9 +567,9 @@ def replace_image_references(text, file_id):
     result = []
 
     # 匹配带标题的图片引用
-    pattern_with_caption = r'^!\[figure\]\((.+\.jpg)\s+(.+)\)$'
+    pattern_with_caption = r'^!\[figure\]\((.+\.(?:jpg|jpeg|png|webp))\s+(.+)\)$'
     # 匹配不带标题的图片引用
-    pattern_without_caption = r'^!\[figure\]\((.+\.jpg)\)$'
+    pattern_without_caption = r'^!\[figure\]\((.+\.(?:jpg|jpeg|png|webp))\)$'
 
     for line in lines:
         if not line.startswith('![figure]'):

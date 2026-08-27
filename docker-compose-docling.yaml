@@ -1,0 +1,22 @@
+# Docling 本地文档解析服务
+# 部署在 B 端（192.168.110.169），用于替换原有的 pdf_parser(9009) 与 ocr(7001) 服务
+# A 端通过 DOCLING_SERVICE_URL=192.168.110.169:5001 调用它
+services:
+  docling-serve:
+    image: quay.io/docling-project/docling-serve-cpu:latest
+    container_name: docling-serve
+    ports:
+      - "5001:5001"
+    environment:
+      # 开启 Web UI，方便浏览器打开 http://<B端IP>:5001/ui 拖拽测试
+      - DOCLING_SERVE_ENABLE_UI=true
+      # 可选：设置 API Key（设置后 A 端需在请求头带上 X-Api-Key，当前 A 端未配置，先留空）
+      # - DOCLING_SERVE_API_KEY=change-me
+    restart: unless-stopped
+    # B 端内存紧张，去掉 pdf_parser/ocr 后视剩余内存决定是否限制（Docling 建议 ≥4GB）
+    # mem_limit: 6g
+    # 若启动后解析报"模型缺失"，说明该镜像版本未内置模型，取消下面注释挂载缓存目录：
+    # volumes:
+    #   - docling_cache:/root/.cache
+# volumes:
+#   docling_cache:

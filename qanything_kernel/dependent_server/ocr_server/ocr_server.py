@@ -24,6 +24,10 @@ from sanic.request import Request
 from sanic.response import json
 import base64
 import argparse
+import torch
+from PIL import Image
+from qanything_kernel.dependent_server.pdf_parser_server.pdf_to_markdown.core.vision.layout_recognizer import LayoutRecognizer
+from qanything_kernel.dependent_server.pdf_parser_server.pdf_to_markdown.core.vision.table_structure_recognizer_lore import TableStructureRecognizer_LORE
 
 # 接收外部参数mode
 parser = argparse.ArgumentParser()
@@ -612,6 +616,31 @@ class OCRQAnything(object):
         time_dict['all'] = end - start
         return [item[0] for item in list(filter_rec_res)]
 
+    def detect_and_recognize(self, img):
+        """返回 [(x0, top, x1, bottom, text, score), ...]，坐标为原图像素坐标，供版面/表格识别使用。"""
+        if img is None:
+            return []
+        ori_im = img.copy()
+        dt_boxes, _ = self.text_detector(img)
+        if dt_boxes is None:
+            return []
+        dt_boxes = self.sorted_boxes(dt_boxes)
+        img_crop_list = []
+        for bno in range(len(dt_boxes)):
+            tmp_box = copy.deepcopy(dt_boxes[bno])
+            img_crop = self.get_rotate_crop_image(ori_im, tmp_box)
+            img_crop_list.append(img_crop)
+        rec_res, _ = self.text_recognizer(img_crop_list)
+        results = []
+        for box, rec_result in zip(dt_boxes, rec_res):
+            text, score = rec_result
+            if score < self.drop_score:
+                continue
+            xs = [float(p[0]) for p in box]
+            ys = [float(p[1]) for p in box]
+            results.append((min(xs), min(ys), max(xs), max(ys), text, score))
+        return results
+
 
 app = Sanic("OCRService")
 
@@ -620,6 +649,80 @@ app = Sanic("OCRService")
 async def setup_ocr(app, loop):
     device = 'cpu' if not args.use_gpu else 'cuda'
     app.ctx.ocr = OCRQAnything(model_dir=OCR_MODEL_PATH, device=device)
+    # 加载版面识别 + 表格结构识别模型（与 pdf_parser 引擎同源组件，会额外占用一份内存）
+    app.ctx.layouter = LayoutRecognizer("layout", torch.device(device))
+    app.ctx.tbl_det = TableStructureRecognizer_LORE(device=torch.device(device))
+
+
+def recognize_with_layout(app, img_bgr):
+    """对单张图片做 OCR + 版面识别 + 表格结构识别，返回按阅读顺序的 markdown 文本。"""
+    ocr = app.ctx.ocr
+    layouter = app.ctx.layouter
+    tbl_det = app.ctx.tbl_det
+
+    # 1. OCR 检测 + 识别，得到原图坐标的文字框
+    results = ocr.detect_and_recognize(img_bgr)
+    if not results:
+        return ""
+
+    # 2. 组装成 LayoutRecognizer 需要的 box 格式
+    boxes = [{"x0": x0, "x1": x1, "top": top, "bottom": bottom, "text": text}
+             for (x0, top, x1, bottom, text, _score) in results]
+
+    # 3. 版面识别（原图坐标，scale_factor=1）
+    pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    try:
+        boxes_layout, _page_layout = layouter([pil_img], [boxes], scale_factor=1, thr=0.4, drop=False)
+    except Exception as e:
+        print(f"layout recognize failed: {e}", flush=True)
+        return '\n'.join([t for (_x0, _top, _x1, _bottom, t, _s) in results])
+
+    if not boxes_layout:
+        return '\n'.join([t for (_x0, _top, _x1, _bottom, t, _s) in results])
+
+    # 4. 对 table 区域做表格结构识别
+    table_markdowns = {}
+    for b in boxes_layout:
+        if b.get("layout_type") != "table":
+            continue
+        lno = b.get("layoutno")
+        if lno in table_markdowns:
+            continue
+        table_boxes = [bb for bb in boxes_layout if bb.get("layoutno") == lno]
+        if not table_boxes:
+            continue
+        x0 = min(bb["x0"] for bb in table_boxes)
+        x1 = max(bb["x1"] for bb in table_boxes)
+        top = min(bb["top"] for bb in table_boxes)
+        bottom = max(bb["bottom"] for bb in table_boxes)
+        table_img = pil_img.crop((int(x0), int(top), int(x1), int(bottom)))
+        try:
+            res = tbl_det.construct_table(table_boxes, table_img, (x0, x1, top, bottom), 0, zoomin=1)
+            table_markdowns[lno] = res.get('table_markdown', '')
+        except Exception as e:
+            print(f"table recognize failed: {e}", flush=True)
+            table_markdowns[lno] = '\n'.join([bb.get("text", "") for bb in table_boxes])
+
+    # 5. 按阅读顺序组装输出
+    sorted_boxes = sorted(boxes_layout, key=lambda b: (b.get("top", 0), b.get("x0", 0)))
+    lines = []
+    seen_table = set()
+    for b in sorted_boxes:
+        lt = b.get("layout_type", "")
+        if lt == "table":
+            lno = b.get("layoutno")
+            if lno in seen_table:
+                continue
+            seen_table.add(lno)
+            md = table_markdowns.get(lno, "")
+            if md:
+                lines.append(md)
+        else:
+            txt = b.get("text", "").strip()
+            if txt:
+                lines.append(txt)
+    return '\n'.join(lines)
+
 
 @app.post("/ocr")
 async def ocr_api(request: Request):
@@ -638,6 +741,26 @@ async def ocr_api(request: Request):
         return json({"error": "Invalid image file"}, status=400)
 
     result = app.ctx.ocr(img)
+    return json({"result": result})
+
+
+@app.post("/ocr_layout")
+async def ocr_layout_api(request: Request):
+    img64 = safe_get(request, 'img64')
+
+    if img64 is None:
+        return json({"error": "No image data provided"}, status=400)
+
+    try:
+        img_data = base64.b64decode(img64)
+        img = cv2.imdecode(np.frombuffer(img_data, np.uint8), cv2.IMREAD_COLOR)
+    except Exception as e:
+        return json({"error": "Invalid image data"}, status=400)
+
+    if img is None:
+        return json({"error": "Invalid image file"}, status=400)
+
+    result = recognize_with_layout(request.app, img)
     return json({"result": result})
 
 

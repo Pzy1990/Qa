@@ -21,13 +21,12 @@ class TableStructureRecognizer_LORE():
             return True
         return False
 
-    def construct_table(self, boxes, image, table_box, height, is_english=False, html=False):
+    def construct_table(self, boxes, image, table_box, height, is_english=False, html=False, zoomin=3):
         """
         接收一个表格的ocr结果，同时接收一个表格的图片，最终需要返回该表格的html结果
         """
         ocr_result = []
         table_caption = ''
-        zoomin = 3
         t_x1, t_x2, t_y1, t_y2 = table_box
         table_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         for item in boxes:

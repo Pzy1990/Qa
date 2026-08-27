@@ -2,7 +2,9 @@ from qanything_kernel.utils.general_utils import get_time, get_table_infos, num_
     html_to_markdown, clear_string, get_time_async
 from typing import List, Optional
 from qanything_kernel.configs.model_config import UPLOAD_ROOT_PATH, LOCAL_OCR_SERVICE_URL, IMAGES_ROOT_PATH, \
-    DEFAULT_CHILD_CHUNK_SIZE, LOCAL_PDF_PARSER_SERVICE_URL, SEPARATORS
+    DEFAULT_CHILD_CHUNK_SIZE, LOCAL_PDF_PARSER_SERVICE_URL, SEPARATORS, \
+    MINERU_API_BASE, MINERU_TOKEN, MINERU_MODEL_VERSION, MINERU_IS_OCR, \
+    DOCLING_SERVICE_URL, DOCLING_TIMEOUT
 from langchain.docstore.document import Document
 from qanything_kernel.utils.loader.my_recursive_url_loader import MyRecursiveUrlLoader
 from qanything_kernel.utils.custom_log import insert_logger
@@ -31,6 +33,7 @@ import traceback
 import openpyxl
 import shutil
 import time
+import zipfile
 
 
 def get_ocr_result_sync(image_data):
@@ -79,6 +82,181 @@ def get_pdf_result_sync(file_path):
         return markdown_file
     except Exception as e:
         insert_logger.warning(f"pdf parser error: {traceback.format_exc()}")
+        return None
+
+
+def _extract_docling_images(md_text, img_dir):
+    """把 Docling 输出的 base64 内嵌图片（data URI）写回磁盘，替换为本地文件引用。"""
+    pattern = re.compile(r'!\[([^\]]*)\]\(data:image/(png|jpeg|jpg|gif|webp|bmp);base64,([A-Za-z0-9+/=]+)\)')
+
+    counter = 0
+
+    def repl(m):
+        nonlocal counter
+        ext = m.group(2).lower()
+        if ext == 'jpeg':
+            ext = 'jpg'
+        try:
+            img_bytes = base64.b64decode(m.group(3))
+        except Exception:
+            return m.group(0)
+        img_name = f"docling_img_{counter:03d}.{ext}"
+        with open(os.path.join(img_dir, img_name), 'wb') as f:
+            f.write(img_bytes)
+        counter += 1
+        return f"![figure]({img_name})"
+
+    return pattern.sub(repl, md_text)
+
+
+def get_docling_result_sync(file_path):
+    """调用本地 Docling Serve 解析 PDF/图片，返回本地 markdown 文件路径。失败返回 None。"""
+    try:
+        filename = os.path.basename(file_path)
+        with open(file_path, 'rb') as f:
+            files = {"files": (filename, f, "application/octet-stream")}
+            data = {
+                "to_formats": "md",
+                "do_ocr": "true",
+                "image_export_mode": "embedded",
+                "table_mode": "accurate",
+            }
+            resp = requests.post(
+                f"http://{DOCLING_SERVICE_URL}/v1/convert/file",
+                files=files,
+                data=data,
+                timeout=DOCLING_TIMEOUT,
+            )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") not in ("success", "partial_success"):
+            insert_logger.warning(f"docling convert failed: {result.get('errors')}")
+            return None
+        md_text = result.get("document", {}).get("md_content", "")
+        if not md_text:
+            insert_logger.warning("docling no md_content")
+            return None
+
+        save_dir = os.path.dirname(file_path)
+        base = os.path.splitext(filename)[0]
+        markdown_path = os.path.join(save_dir, base + '_md')
+        os.makedirs(markdown_path, exist_ok=True)
+
+        # 把 base64 内嵌图片写回磁盘，替换为本地文件引用
+        md_text = _extract_docling_images(md_text, markdown_path)
+
+        markdown_file = os.path.join(markdown_path, base + '.md')
+        with open(markdown_file, 'w', encoding='utf-8') as f:
+            f.write(md_text)
+
+        return markdown_file
+    except Exception as e:
+        insert_logger.warning(f"docling parse error: {traceback.format_exc()}")
+        return None
+
+
+def get_mineru_result_sync(file_path):
+    """调用 MinerU 在线 API 精准解析 PDF/图片，返回本地 markdown 文件路径。失败返回 None。"""
+    try:
+        filename = os.path.basename(file_path)
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {MINERU_TOKEN}",
+        }
+
+        # 1. 申请上传链接（批量上传接口，一次一个文件）
+        batch_url = f"{MINERU_API_BASE}/api/v4/file-urls/batch"
+        body = {
+            "files": [{"name": filename, "is_ocr": MINERU_IS_OCR}],
+            "model_version": MINERU_MODEL_VERSION,
+        }
+        resp = requests.post(batch_url, json=body, headers=headers, timeout=60)
+        resp_json = resp.json()
+        if resp_json.get("code") != 0:
+            insert_logger.warning(f"mineru batch apply error: {resp_json}")
+            return None
+        batch_id = resp_json.get("data", {}).get("batch_id")
+        file_urls = resp_json.get("data", {}).get("file_urls") or []
+        if not batch_id or not file_urls:
+            insert_logger.warning(f"mineru batch apply no batch_id/file_urls: {resp_json}")
+            return None
+
+        # 2. PUT 上传文件（上传完成后系统自动提交解析）
+        with open(file_path, 'rb') as f:
+            up = requests.put(file_urls[0], data=f, timeout=600)
+        if up.status_code >= 400:
+            insert_logger.warning(f"mineru upload failed: {up.status_code} {up.text[:200]}")
+            return None
+
+        # 3. 轮询批量结果直到 done/failed
+        result_url = f"{MINERU_API_BASE}/api/v4/extract-results/batch/{batch_id}"
+        full_zip_url = None
+        for _ in range(180):  # 最多约 6 分钟
+            r = requests.get(result_url, headers=headers, timeout=30)
+            rj = r.json()
+            if rj.get("code") != 0:
+                insert_logger.warning(f"mineru result error: {rj}")
+                return None
+            results = rj.get("data", {}).get("extract_result") or []
+            if not results:
+                time.sleep(2)
+                continue
+            item = results[0]
+            state = item.get("state")
+            if state == "done":
+                full_zip_url = item.get("full_zip_url")
+                break
+            if state == "failed":
+                insert_logger.warning(f"mineru failed: {item.get('err_msg')}")
+                return None
+            time.sleep(2)
+
+        if not full_zip_url:
+            insert_logger.warning("mineru timeout waiting result")
+            return None
+
+        # 4. 下载结果 zip，解压 full.md 与图片
+        zr = requests.get(full_zip_url, timeout=300)
+        zip_path = file_path + ".mineru.zip"
+        with open(zip_path, 'wb') as f:
+            f.write(zr.content)
+
+        save_dir = os.path.dirname(file_path)
+        base = os.path.splitext(filename)[0]
+        markdown_path = os.path.join(save_dir, base + '_md')
+        os.makedirs(markdown_path, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            md_text = None
+            for n in z.namelist():
+                if n.endswith('full.md'):
+                    md_text = z.read(n).decode('utf-8')
+                    break
+            if md_text is None:
+                insert_logger.warning(f"mineru zip no full.md: {z.namelist()[:10]}")
+                return None
+            # 解压图片到 markdown 目录（用 basename，便于 copy_images 提取）
+            for n in z.namelist():
+                if n.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    img_name = os.path.basename(n)
+                    with open(os.path.join(markdown_path, img_name), 'wb') as f:
+                        f.write(z.read(n))
+
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+        # 去掉 MinerU 图片引用的 images/ 前缀，使引用路径与解压到 markdown 目录的图片文件名一致
+        md_text = re.sub(r'!\[([^\]]*)\]\(images/', r'![\1](', md_text)
+
+        markdown_file = os.path.join(markdown_path, base + '.md')
+        with open(markdown_file, 'w', encoding='utf-8') as f:
+            f.write(md_text)
+
+        return markdown_file
+    except Exception as e:
+        insert_logger.warning(f"mineru parse error: {traceback.format_exc()}")
         return None
 
 
@@ -375,8 +553,9 @@ class LocalFileForInsert:
     def copy_images(image_root_path, output_dir):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        # 获取当前目录下所有jpg文件
-        images = [f for f in os.listdir(image_root_path) if f.endswith('.jpg')]
+        # 获取当前目录下所有图片文件
+        image_exts = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')
+        images = [f for f in os.listdir(image_root_path) if f.lower().endswith(image_exts)]
         # 复制到指定目录
         for image in images:
             single_image_path = os.path.join(image_root_path, image)
@@ -412,7 +591,9 @@ class LocalFileForInsert:
         elif self.file_path.lower().endswith(".txt"):
             docs = self.load_text(self.file_path)
         elif self.file_path.lower().endswith(".pdf"):
-            markdown_file = get_pdf_result_sync(self.file_path)
+            markdown_file = get_docling_result_sync(self.file_path)
+            if not markdown_file:
+                markdown_file = get_mineru_result_sync(self.file_path)
             if markdown_file:
                 docs = convert_markdown_to_langchaindoc(markdown_file)
                 docs = self.markdown_process(docs)
@@ -420,14 +601,23 @@ class LocalFileForInsert:
                 self.copy_images(os.path.dirname(markdown_file), images_dir)
             else:
                 insert_logger.warning(
-                    f'Error in Powerful PDF parsing, use fast PDF parser instead.')
+                    f'Error in PDF parsing, use fast PDF parser instead.')
                 loader = UnstructuredPaddlePDFLoader(self.file_path, strategy="fast")
                 docs = loader.load()
         elif self.file_path.lower().endswith(".jpg") or self.file_path.lower().endswith(
                 ".png") or self.file_path.lower().endswith(".jpeg"):
-            txt_file_path = self.image_ocr_txt(filepath=self.file_path)
-            loader = TextLoader(txt_file_path, autodetect_encoding=True)
-            docs = loader.load()
+            markdown_file = get_docling_result_sync(self.file_path)
+            if not markdown_file:
+                markdown_file = get_mineru_result_sync(self.file_path)
+            if markdown_file:
+                docs = convert_markdown_to_langchaindoc(markdown_file)
+                docs = self.markdown_process(docs)
+                images_dir = os.path.join(IMAGES_ROOT_PATH, self.file_id)
+                self.copy_images(os.path.dirname(markdown_file), images_dir)
+            else:
+                txt_file_path = self.image_ocr_txt(filepath=self.file_path)
+                loader = TextLoader(txt_file_path, autodetect_encoding=True)
+                docs = loader.load()
         elif self.file_path.lower().endswith(".docx"):
             try:
                 loader = UnstructuredWordDocumentLoader(self.file_path, strategy="fast")
@@ -488,8 +678,8 @@ class LocalFileForInsert:
             new_doc.metadata["file_url"] = self.file_url
             new_doc.metadata["title_lst"] = doc.metadata.get("title_lst", [])
             new_doc.metadata["has_table"] = doc.metadata.get("has_table", False)
-            # 从文本中提取图片数量：![figure]（x-figure-x.jpg）
-            new_doc.metadata["images"] = re.findall(r'!\[figure]\(\d+-figure-\d+.jpg.*?\)', page_content)
+            # 从文本中提取图片引用（兼容原 pdf_to_markdown 的 page-layoutno 命名与 MinerU 的 hash 命名）
+            new_doc.metadata["images"] = re.findall(r'!\[figure]\([^)]+\)', page_content)
             new_doc.metadata["page_id"] = doc.metadata.get("page_id", 0)
             kb_name = self.mysql_client.get_knowledge_base_name([self.kb_id])[0][2]
             metadata_infos = {"知识库名": kb_name, '文件名': self.file_name}

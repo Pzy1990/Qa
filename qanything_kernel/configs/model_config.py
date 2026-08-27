@@ -194,6 +194,17 @@ LOCAL_OCR_SERVICE_URL = "192.168.110.169:7001"
 
 LOCAL_PDF_PARSER_SERVICE_URL = "192.168.110.169:9009"
 
+# MinerU 在线解析 API（用于 PDF 与图片文件的精准解析，作为 Docling 失败时的回退）
+MINERU_API_BASE = os.getenv('MINERU_API_BASE', 'https://mineru.net')
+MINERU_TOKEN = os.getenv('MINERU_TOKEN', 'sk-fEdw9KibAyW44OB1AzAkSv1aVc11l2L7Mp3x1fK7Hj4F6SFS')
+# model_version: pipeline(快速) / vlm(精准，视觉大模型)
+MINERU_MODEL_VERSION = os.getenv('MINERU_MODEL_VERSION', 'vlm')
+MINERU_IS_OCR = True
+
+# Docling 本地解析服务（PDF/图片精准解析的主力，替代 B 端 pdf_parser/ocr 与 MinerU 在线 API）
+DOCLING_SERVICE_URL = os.getenv('DOCLING_SERVICE_URL', '192.168.110.169:5001')
+DOCLING_TIMEOUT = int(os.getenv('DOCLING_TIMEOUT', '600'))
+
 LOCAL_RERANK_SERVICE_URL = "localhost:8001"
 LOCAL_RERANK_MODEL_NAME = 'rerank'
 LOCAL_RERANK_MAX_LENGTH = 512
